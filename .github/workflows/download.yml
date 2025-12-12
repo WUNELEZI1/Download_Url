@@ -1,0 +1,115 @@
+name: 跨境文件下载与国内加速分发
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: '需要下载的文件链接（支持直链，如Python官网、GitHub Release等）'
+        required: true
+        type: string
+      file_name:
+        description: '自定义保存的文件名（留空则自动解析）'
+        required: false
+        type: string
+      release_tag:
+        description: 'Releases标签（用于归类文件，默认latest）'
+        required: false
+        default: 'latest'
+        type: string
+
+jobs:
+  download-and-distribute:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 系统环境准备
+        run: |
+          sudo apt update && sudo apt install -y curl wget jq unzip zip
+          # 安装GitHub CLI（用于操作Releases）
+          type -p gh >/dev/null || (sudo apt install -y gh)
+
+      - name: 解析下载链接并下载文件
+        id: download
+        run: |
+          # 设置文件名（优先用户输入，否则自动解析）
+          if [ -n "${{ github.event.inputs.file_name }}" ]; then
+            FILE_NAME="${{ github.event.inputs.file_name }}"
+          else
+            # 从URL解析文件名（处理各种链接格式）
+            FILE_NAME=$(basename "${{ github.event.inputs.target_url }}" | sed -e 's/\?.*//' -e 's/#.*//')
+            # 处理无后缀的情况（如Python源码包）
+            if [[ -z "${FILE_NAME##*/*}" ]]; then
+              FILE_NAME="downloaded_file_$(date +%Y%m%d%H%M%S)"
+            fi
+          fi
+          
+          echo "文件名: $FILE_NAME"
+          echo "file_name=$FILE_NAME" >> $GITHUB_OUTPUT
+          
+          # 智能选择下载工具（curl/wget），添加重试和超时
+          if wget --version >/dev/null 2>&1; then
+            wget -c --no-check-certificate --timeout=300 --tries=5 \
+              "${{ github.event.inputs.target_url }}" -O "$FILE_NAME"
+          else
+            curl -fL --retry 5 --connect-timeout 300 \
+              "${{ github.event.inputs.target_url }}" -o "$FILE_NAME"
+          fi
+          
+          # 验证文件完整性
+          if [ ! -f "$FILE_NAME" ]; then
+            echo "文件下载失败！"
+            exit 1
+          fi
+          echo "文件大小: $(du -h "$FILE_NAME" | awk '{print $1}')"
+
+      - name: 配置GitHub CLI
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh auth login --with-token <<< "$GITHUB_TOKEN"
+
+      - name: 创建/更新GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 检查标签是否存在，不存在则创建
+          if ! gh release view "${{ github.event.inputs.release_tag }}" >/dev/null 2>&1; then
+            gh release create "${{ github.event.inputs.release_tag }}" \
+              --title "加速分发文件_${{ github.event.inputs.release_tag }}" \
+              --notes "文件源地址：${{ github.event.inputs.target_url }}"
+          fi
+          
+          # 上传文件到Release（覆盖同名文件）
+          gh release upload "${{ github.event.inputs.release_tag }}" "${{ steps.download.outputs.file_name }}" --clobber
+
+      - name: 生成国内加速下载链接
+        run: |
+          # 基础GitHub Release链接
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.release_tag }}/${{ steps.download.outputs.file_name }}"
+          
+          # 1. jsDelivr加速（推荐，国内CDN）
+          JSDELIVR_URL="https://cdn.jsdelivr.net/gh/${{ github.repository }}@${{ github.event.inputs.release_tag }}/${{ steps.download.outputs.file_name }}"
+          
+          # 2. GitHub Proxy加速（备用）
+          PROXY_URL="https://ghproxy.com/${BASE_URL}"
+          
+          # 3. FastGit加速（备用）
+          FASTGIT_URL="https://download.fastgit.org/${{ github.repository }}/releases/download/${{ github.event.inputs.release_tag }}/${{ steps.download.outputs.file_name }}"
+          
+          echo "===== 国内加速下载链接 ====="
+          echo "原始链接：$BASE_URL"
+          echo "JSDELIVR（推荐）：$JSDELIVR_URL"
+          echo "GitHub Proxy：$PROXY_URL"
+          echo "FastGit：$FASTGIT_URL"
+          echo "============================"
+          
+          # 将链接写入文件，方便后续查看
+          echo "原始链接：$BASE_URL" > download_links.txt
+          echo "JSDELIVR（推荐）：$JSDELIVR_URL" >> download_links.txt
+          echo "GitHub Proxy：$PROXY_URL" >> download_links.txt
+          echo "FastGit：$FASTGIT_URL" >> download_links.txt
+
+      - name: 上传加速链接文件作为Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-links
+          path: download_links.txt
+          retention-days: 90  # 链接文件保留90天
