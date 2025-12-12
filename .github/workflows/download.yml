@@ -19,12 +19,16 @@ on:
 jobs:
   download-and-distribute:
     runs-on: ubuntu-latest
+    permissions:  # 关键：显式声明权限（修复gh cli认证问题）
+      contents: write  # 必须：允许创建/上传Release
     steps:
       - name: 系统环境准备
         run: |
           sudo apt update && sudo apt install -y curl wget jq unzip zip
-          # 安装GitHub CLI（用于操作Releases）
-          type -p gh >/dev/null || (sudo apt install -y gh)
+          # 安装最新版gh cli（避免版本兼容问题）
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update && sudo apt install -y gh
 
       - name: 解析下载链接并下载文件
         id: download
@@ -60,25 +64,24 @@ jobs:
           fi
           echo "文件大小: $(du -h "$FILE_NAME" | awk '{print $1}')"
 
-      - name: 配置GitHub CLI
+      - name: 创建/更新GitHub Release（修复gh cli语法）
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh auth login --with-token <<< "$GITHUB_TOKEN"
-
-      - name: 创建/更新GitHub Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # 检查标签是否存在，不存在则创建
-          if ! gh release view "${{ github.event.inputs.release_tag }}" >/dev/null 2>&1; then
+          # 强制使用token认证，避免环境变量冲突
+          export GH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          
+          # 检查标签是否存在，不存在则创建（兼容空描述）
+          if ! gh release view "${{ github.event.inputs.release_tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release create "${{ github.event.inputs.release_tag }}" \
               --title "加速分发文件_${{ github.event.inputs.release_tag }}" \
-              --notes "文件源地址：${{ github.event.inputs.target_url }}"
+              --notes "文件源地址：${{ github.event.inputs.target_url }}" \
+              --repo "${{ github.repository }}"
           fi
           
-          # 上传文件到Release（覆盖同名文件）
-          gh release upload "${{ github.event.inputs.release_tag }}" "${{ steps.download.outputs.file_name }}" --clobber
+          # 上传文件到Release（覆盖同名文件，显式指定仓库）
+          gh release upload "${{ github.event.inputs.release_tag }}" "${{ steps.download.outputs.file_name }}" \
+            --clobber --repo "${{ github.repository }}"
 
       - name: 生成国内加速下载链接
         run: |
